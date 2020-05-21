@@ -26,6 +26,9 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#ifdef ENABLE_ZSTD
+#include <zstd.h>
+#endif
 #ifdef ENABLE_XZ
 #include <lzma.h>
 #endif
@@ -45,6 +48,9 @@ struct file_ops {
 };
 
 struct kmod_file {
+#ifdef ENABLE_ZSTD
+	bool zstd_used;
+#endif
 #ifdef ENABLE_XZ
 	bool xz_used;
 #endif
@@ -59,6 +65,109 @@ struct kmod_file {
 	const struct kmod_ctx *ctx;
 	struct kmod_elf *elf;
 };
+
+#ifdef ENABLE_ZSTD
+static int load_zstd(struct kmod_file *file)
+{
+	ZSTD_DStream* dstr = NULL;
+	size_t in_buf_size, out_buf_min_size, out_buf_size;
+	uint8_t *in_buf = NULL, *out_buf = NULL;
+	ZSTD_inBuffer zst_input;
+	ZSTD_outBuffer zst_output;
+	int ret = -EINVAL;
+
+	dstr = ZSTD_createDStream();
+	if (dstr == NULL) {
+		ERR(file->ctx, "zstd: Failed to create decompression stream\n");
+		ret = -EINVAL;
+		goto out;
+	}
+
+	in_buf_size = ZSTD_initDStream(dstr);
+	in_buf = malloc(in_buf_size);
+	if (in_buf == NULL) {
+		ERR(file->ctx, "zstd: %s\n", strerror(ENOMEM));
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	out_buf_size = out_buf_min_size = ZSTD_DStreamOutSize();
+	out_buf = malloc(out_buf_size);
+	if (out_buf == NULL) {
+		ERR(file->ctx, "zstd: %s\n", strerror(ENOMEM));
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	zst_input.src = in_buf;
+	zst_output.dst = out_buf;
+	zst_output.size = out_buf_size;
+	zst_output.pos = 0;
+	while (true) {
+		ssize_t rdret;
+
+		rdret = read(file->fd, in_buf, in_buf_size);
+		if (rdret < 0) {
+			ret = -errno;
+			goto out;
+		}
+		if (rdret == 0)
+			break;
+
+		zst_input.size = rdret;
+		zst_input.pos = 0;
+		do {
+			while (true) {
+				size_t dsret;
+				uint8_t *tmp;
+
+				dsret = ZSTD_decompressStream(dstr, &zst_output , &zst_input);
+				if (ZSTD_isError(dsret)) {
+					ERR(file->ctx, "zstd: %s\n", ZSTD_getErrorName(dsret));
+					ret = -EINVAL;
+					goto out;
+				}
+
+				if (zst_output.pos < zst_output.size
+					&& zst_output.size - zst_output.pos >= out_buf_min_size)
+					break;
+
+				tmp = realloc(out_buf, out_buf_size + out_buf_min_size);
+				if (tmp == NULL) {
+					ret = -errno;
+					goto out;
+				}
+				out_buf_size += out_buf_min_size;
+				out_buf = tmp;
+				zst_output.dst = out_buf;
+				zst_output.size = out_buf_size;
+			}
+		} while (zst_input.pos < zst_input.size);
+	}
+
+	ZSTD_freeDStream(dstr);
+	free(in_buf);
+	file->zstd_used = true;
+	file->memory = out_buf;
+	file->size = zst_output.pos;
+	return 0;
+out:
+	if (dstr != NULL)
+		ZSTD_freeDStream(dstr);
+	free(out_buf);
+	free(in_buf);
+	return ret;
+}
+
+static void unload_zstd(struct kmod_file *file)
+{
+	if (!file->zstd_used)
+		return;
+	free(file->memory);
+}
+
+static const char magic_zstd[] = {0x28, 0xB5, 0x2F, 0xFD};
+#endif
 
 #ifdef ENABLE_XZ
 static void xz_uncompress_belch(struct kmod_file *file, lzma_ret ret)
@@ -238,6 +347,9 @@ static const struct comp_type {
 	const char *magic_bytes;
 	const struct file_ops ops;
 } comp_types[] = {
+#ifdef ENABLE_ZSTD
+	{sizeof(magic_zstd), magic_zstd, {load_zstd, unload_zstd}},
+#endif
 #ifdef ENABLE_XZ
 	{sizeof(magic_xz), magic_xz, {load_xz, unload_xz}},
 #endif
